@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -16,11 +18,22 @@ const (
 	ERROR_WAIT_START_MSEC  = 100
 )
 
+type InternalStats struct {
+	connectionCount        uint64
+	currentConnectionCount uint64
+	messagesRelayed        uint64
+	messagesDropped        uint64
+	invalidMessages        uint64
+	augmentedMessages      uint64
+}
+
 var (
-	carbonClientHandler_count uint64 = 0
-	metricsBufferSize         uint64 = 1048576
-	laddr                     string = ":2003"
-	raddr                     string = ""
+	metricsBufferSize uint64 = 1048576
+	laddr             string = ":2003"
+	raddr             string = ""
+	stats             InternalStats
+	statsInterval     uint   = 60
+	statsFmt          string = "carbon.carbuffd.%[1]s.%[2]s"
 )
 
 func carbonMetricFilter(l string) (string, bool) {
@@ -41,14 +54,16 @@ func carbonMetricFilter(l string) (string, bool) {
 	}
 	_, err := strconv.ParseUint(epoch, 10, 64)
 	if err != nil {
+		stats.augmentedMessages++
 		epoch = strconv.FormatInt(time.Now().Unix(), 10)
 		//fmt.Printf("carbonMetricFilter: metric %s augmented with epoch %s\n", metric, epoch)
 	}
 	return fmt.Sprintf("%s %s %s", metric, value, epoch), true
 }
 func carbonClientHandler(c net.Conn, ch chan string) {
-	fmt.Printf("carbonClientHandler[%d]: %s accepted\n", carbonClientHandler_count, c.RemoteAddr().String())
-	carbonClientHandler_count++
+	fmt.Printf("carbonClientHandler[%d]: %s accepted\n", stats.connectionCount, c.RemoteAddr().String())
+	stats.connectionCount++
+	stats.currentConnectionCount++
 	carbonClientHandler_metrics_ingress_count := 0
 
 	// TODO: socket timeout setzen: max wert <- burst -> min wert
@@ -58,14 +73,14 @@ func carbonClientHandler(c net.Conn, ch chan string) {
 		c.SetReadDeadline(time.Now().Add(SOCKET_TIMEOUT_DEFAULT * time.Second))
 		line, err := reader.ReadString('\n')
 		if err == io.EOF {
-			fmt.Printf("carbonClientHandler[%d]: %s closed (%d lines received)\n", carbonClientHandler_count, c.RemoteAddr().String(), carbonClientHandler_metrics_ingress_count)
+			fmt.Printf("carbonClientHandler[%d]: %s closed (%d lines received)\n", stats.connectionCount, c.RemoteAddr().String(), carbonClientHandler_metrics_ingress_count)
 			break
 		} else if netErr, ok := err.(net.Error); ok {
 			if netErr.Timeout() {
-				fmt.Printf("carbonClientHandler[%d]: %s timeout (%d lines received)\n", carbonClientHandler_count, c.RemoteAddr().String(), carbonClientHandler_metrics_ingress_count)
+				fmt.Printf("carbonClientHandler[%d]: %s timeout (%d lines received)\n", stats.connectionCount, c.RemoteAddr().String(), carbonClientHandler_metrics_ingress_count)
 				break
 			} else if !netErr.Temporary() {
-				fmt.Printf("carbonClientHandler[%d]: %s temporary (%d lines received)\n", carbonClientHandler_count, c.RemoteAddr().String(), carbonClientHandler_metrics_ingress_count)
+				fmt.Printf("carbonClientHandler[%d]: %s temporary (%d lines received)\n", stats.connectionCount, c.RemoteAddr().String(), carbonClientHandler_metrics_ingress_count)
 				break
 			}
 		} else if err != nil {
@@ -76,17 +91,24 @@ func carbonClientHandler(c net.Conn, ch chan string) {
 			continue
 		}
 
-		// TODO metricsChannelReader in Go routine as a filter, it will put complete metrics into the channel
 		metric, isCorrect := carbonMetricFilter(line)
 		if !isCorrect {
-			fmt.Printf("carbonClientHandler[%d]: non metric received '%s'\n", carbonClientHandler_count, line)
+			fmt.Printf("carbonClientHandler[%d]: non metric received '%s' from %s\n", stats.connectionCount, line, c.RemoteAddr().String())
+			stats.invalidMessages++
 			continue
+		}
+		if !(uint64(len(ch)) < metricsBufferSize-1) {
+			// dequeue old events to add newer events
+			<-ch
+			stats.messagesDropped++
+			fmt.Printf("metricsChannelReader: dropped event, queuelen %d ~ limit %d\n", len(ch), metricsBufferSize)
 		}
 		ch <- metric
 		carbonClientHandler_metrics_ingress_count++
 	}
 
 	c.Close()
+	stats.currentConnectionCount--
 }
 func carbonServer(laddr string, ch chan string) {
 	l, err := net.Listen("tcp", laddr)
@@ -138,17 +160,57 @@ func metricsChannelReader(raddr string, ch chan string) {
 		if err == nil {
 			err_wait_msec = ERROR_WAIT_START_MSEC * time.Millisecond
 			//fmt.Printf("%s\n", m)
+			stats.messagesRelayed++
 		} else {
 			time.Sleep(err_wait_msec)
 			err_wait_msec *= 2
-			ch <- m
-			fmt.Printf("metricsChannelReader: %v, requeuing, %d queuelen, wait %v\n", err, len(ch), err_wait_msec)
+			// if channel is not full reinsert it
+			if uint64(len(ch)) < metricsBufferSize-1 {
+				ch <- m
+				fmt.Printf("metricsChannelReader: %v, requeued, %d queuelen, wait %v\n", err, len(ch), err_wait_msec)
+			} else {
+				stats.messagesDropped++
+				fmt.Printf("metricsChannelReader: %v, not requeued, %d queuelen ~ limit %d, wait %v\n", err, len(ch), metricsBufferSize, err_wait_msec)
+			}
 		}
+	}
+}
+func internalMetricsGenerator(ch chan string) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		panic(err)
+	}
+	hostname = strings.Replace(hostname, ".", "_", -1)
+	tmpl := statsFmt + " %d %d"
+	for {
+		time.Sleep(time.Duration(statsInterval) * time.Second)
+		epoch := time.Now().Unix()
+
+		reflectStats := reflect.ValueOf(&stats).Elem()
+		for i := 0; i < reflectStats.NumField(); i++ {
+			name := reflectStats.Type().Field(i).Name
+			val := reflectStats.Field(i)
+			metric := fmt.Sprintf(tmpl, hostname, name, val, epoch)
+
+			if !(uint64(len(ch)) < metricsBufferSize-1) {
+				// dequeue old events to add newer events
+				<-ch
+				stats.messagesDropped++
+				fmt.Printf("metricsChannelReader: dropped event, queuelen %d ~ limit %d\n", len(ch), metricsBufferSize)
+			}
+			ch <- metric
+			fmt.Printf("internalMetricsGenerator: %s\n", metric)
+		}
+
 	}
 }
 func main() {
 
+	flag.Uint64Var(&metricsBufferSize, "l", metricsBufferSize, "default queue len")
+	flag.UintVar(&statsInterval, "i", statsInterval, "interval for internal metrics")
+	flag.StringVar(&statsFmt, "p", statsFmt, "format for internal statistics %[1]s = HOSTNAME, %[2]s is the metric name, if empty no internal metrics will be generated")
 	flag.Parse()
+
 	if len(flag.Args()) == 1 {
 		laddr = flag.Args()[0]
 	} else if len(flag.Args()) == 2 {
@@ -160,6 +222,7 @@ func main() {
 
 	metricsChannel := make(chan string, metricsBufferSize)
 	go carbonServer(laddr, metricsChannel)
+	go internalMetricsGenerator(metricsChannel)
 	metricsChannelReader(raddr, metricsChannel)
 }
 
